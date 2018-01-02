@@ -1,138 +1,125 @@
-import requests, re, json, os, subprocess, time
+import requests
+import re
+import pickle
+import os
+import subprocess
 
-class Kaggle:
+cookie_file = '.kg_cookies'
 
-    def __init__(self, username=None, password=None):
-        self.session = requests.Session()
-        self.logged_in = False
+def login(username, password):
+    r = requests.post('https://www.kaggle.com/account/login', 
+                          data={'username': username, 
+                                'password': password})
 
-        if username or password:
-            self.login(username, password)
+    error = re.search(r'errors":\["(.+)"\]', r.text)
+    if error: 
+        raise ValueError(error.group(1))
 
+    with open(cookie_file, 'wb') as f:
+        pickle.dump(r.cookies, f)
 
-    def login(self, username, password):
-        r = self.session.post('https://www.kaggle.com/account/login', 
-                              data={'username': username, 'password': password})
-        
-        error = re.search(r'errors":\["(.+)"\]', r.text)
-        if error:
-            error = error.group(1)
-            raise ValueError(error)
+def logout():
+    with load_session() as s:
+        s.get('https://www.kaggle.com/account/logoff')
+    
+    os.remove(cookie_file)
+
+def load_session():
+    s = requests.Session()
+
+    try:
+        with open(cookie_file, 'rb') as f:
+             s.cookies = pickle.load(f)
+    except OSError:
+        raise PermissionError("Not logged in.")
+
+    return s
+
+def get_competition(competition):
+    with load_session() as s:
+        r = s.get('https://www.kaggle.com/c/' + competition)
+
+        if r.status_code == 404:
+            raise ValueError("Competition does not exist")
+
+        return json.loads(re.search(r'{"activeTab":.*}', r.text).group())
+
+def list_files(competition):
+    data = get_competition(competition)
+    files = [f['name'] for f in data['files']]
+    return files
+
+def extract(files):
+    if os.name == 'nt':
+        subprocess.call(['c:\python2.7\python2.7.exe', 
+                         'c:\python2.7\scripts\patool', 
+                         'extract'].extend(files))
+    else:
+        subprocess.call(['patool', 'extract'].extend(files))
+
+def accept(competiton):
+    data = get_competition(competition)
+
+    if not data['hasAcceptedRules']:
+        with load_session() as s:
+            s.post('https://www.kaggle.com/c/%s/rules/accept.json?doAccept=True' % competition)
+
+def download(competition, files=None, extract=False, accept=True):
+    if accept: 
+        accept(competition)
+    
+    files = files or list_files(competition)
+
+    with load_session() as s:
+        for fname in files:
+            r = s.get('https://www.kaggle.com/c/%s/download/%s' % (competition, fname), stream=True)
             
-        print('Login successful')
-        self.logged_in = True    
-
-    def logout(self):
-        self.session.get('https://www.kaggle.com/account/logoff')
-        self.logged_in = False
-        print('Logout successful')
-
-    def accept(self, competition):
-        if not self.logged_in:
-            raise PermissionError('Not logged in')
-
-        r = self.session.post('https://www.kaggle.com/c/%s/rules/accept.json?doAccept=True' % competition)
-
-        if r.status_code == 404:
-            raise ValueError('Competition does not exist.')
-
-        print('Accepted competition rules')
-
-    def list_files(self, competition):
-        if not self.logged_in:
-            raise PermissionError('Not logged in')
-
-        r = self.session.get('https://www.kaggle.com/c/%s/data' % competition)
-        
-        if r.status_code == 404:
-            raise ValueError('Competition does not exist.')
-
-        data = json.loads(re.search(r'{"activeTab":"data".*}', r.text).group(0))
-        files = [file['name'] for file in data['files']]
-
-        return files
-
-    def download(self, competition, files=None, path=None, extract=False, accept=True):
-        if not self.logged_in:
-            raise PermissionError('Not logged in')
-
-        r = self.session.get('https://www.kaggle.com/c/%s' % competition)
-        if r.status_code == 404:
-            raise ValueError('Competition does not exist.')
-
-        if accept and re.search(r'"hasAcceptedRules":false', r.text):
-            self.accept(competition)
-
-        path = path or os.getcwd()
-        if not os.path.isdir(path):
-            raise OSError(path + ' is not a directory.')
-
-        files = files or self.list_files(competition)
-        for file in files:
-            print('Dowloading %s' % file)
-            r = self.session.get('https://www.kaggle.com/c/%s/download/%s' % (competition, file), stream=True) 
             if r.status_code == 404:
-                raise ValueError('File does not exist.')
+                raise ValueError('File does not exist')
 
-            local_file = os.path.join(path, file)
-            with open(local_file, 'wb') as f:
+            with open(fname, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=1024):
-                    if chunk:
+                    if chunk: 
                         f.write(chunk)
-            
-            if extract:
-                print('Extracting %s' % local_file)
-                if os.name == 'nt':
-                     subprocess.call(['c:\python2.7\python2.7.exe', 'c:\python2.7\scripts\patool.', local_file])
-                else:
-                    subprocess.call(['patool', 'extract', local_file])
 
+    if extract: 
+        [extract(f) for f in files]
 
-    def submit(self, competition, file, accept=True):
-        if not self.logged_in:
-            raise PermissionError('Not logged in')
+def register_file(file):
+    with load_session() as s:
+        r =  s.post('https://www.kaggle.com/blobs/inbox/submissions',
+                    data={'fileName': file,
+                          'contentLength': os.path.getsize(file),
+                          'lastModifiedDateUtc': os.path.getmtime(file) * 1000})
+        return r.json()['createUrl']
 
-        r = self.session.get('https://www.kaggle.com/c/%s' % competition)
-        if r.status_code == 404:
-            raise ValueError('Competition does not exist.')
+def upload_file(file, create_url):
+    with load_session() as s:
+        r = s.post('https://www.kaggle.com' + create_url,
+                   files={'file': open(file, 'rb')})
+        return r.json()['token']
 
-        if accept and re.search(r'"hasAcceptedRules":false', r.text):
-            self.accept(competition)
+def submit_file(file, competition, token):
+    with load_session() as s:
+        s.post('https://www.kaggle.com/c/%s/submission.json' % competition,
+               data={'blobFileTokens': [token]})
 
-        team_id = re.search(r'"team":{"id":(\d+)', r.text).group(1)
-        metric = re.search(r'"evaluationAlgorithm":{"id":\d+,"name":"([A-Za-z ]+)', r.text).group(1)
+def check_submission_status(competition):
+    while True:
+        status = get_competition(competition)['mostRecentSubmissionStatus']
 
-        if not os.path.isfile(file):
-            raise OSError('File does not exist')
-        
-        r = self.session.post('https://www.kaggle.com/blobs/inbox/submissions',
-                              data={'fileName': file,
-                                    'contentLength': os.path.getsize(file),
-                                    'lastModifiedDateUtc': os.path.getmtime(file) * 1000})
-
-        r = self.session.post('https://www.kaggle.com' + r.json()['createUrl'],
-                              files={'file': open(file, 'rb')})
-        
-        r = self.session.post('https://www.kaggle.com/c/%s/submission.json' % competition,
-                              data={'blobFileTokens': [r.json()['token']]})
-
-        while True:
+        if status['submissionStatus'] == 'complete':
+            return (status['publicScoreFormatted'])
+        elif status['submissionStatus'] == 'pending':
             time.sleep(1)
+        else:
+            raise ValueError('Submission not uploaded.')
 
-            r = self.session.get('https://www.kaggle.com/c/%s/submissions/status.json?apiVersion=1' % competition)
-            status = r.json()
+def submit(self, competition, file, accept=True):
+    if accept:
+        accept(competition)
 
-            if status['submissionStatus'] == 'complete':
-                print('%s: %s' % (metric, status['publicScoreFormatted']))
-                print('Rank: %s' % status['rank'])
-                break
-            elif status['submissionStatus'] == 'pending':
-                continue
-            else:
-                print('OOps.')
-                break
-        
-        
+    create_url = register_file(file)
+    submit_file(file, create_url)
 
-
-        
+    return check_submission_status(competition)
